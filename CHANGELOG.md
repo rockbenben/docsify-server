@@ -8,4 +8,4 @@
 - Rebuild monthly to refresh both docsify-cli and the Node LTS base image, reusing existing version tags when versions are unchanged.
 - Test published-port access, offline assets, existing user files, read-only mounts, and disabled initialization before publishing.
 - Default local builds to the latest CLI, record the installed CLI version, and share one resolved Node LTS digest across CI test and release builds.
-- Pin CI Actions to verified current release commits, with dependency updates reviewed manually before releases.
+- Use current major-version references for CI Actions, with dependency updates reviewed manually before releases.
