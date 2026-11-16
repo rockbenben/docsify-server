@@ -11,9 +11,17 @@ TEMPLATE_DIR="/opt/docsify-template"
 if [ "$DOCSIFY_AUTO_INIT" = "true" ] && [ ! -f /docs/index.html ]; then
   if [ -w /docs ]; then
     echo "[docsify-server] /docs 无 index.html —— 生成离线范例站点..."
-    for item in index.html README.md .nojekyll assets; do
-      [ -e "/docs/$item" ] || cp -r "$TEMPLATE_DIR/$item" "/docs/$item"
-    done
+    (
+      cd "$TEMPLATE_DIR"
+      find . -type f ! -path ./index.html | while IFS= read -r item; do
+        if [ ! -e "/docs/$item" ] && [ ! -L "/docs/$item" ]; then
+          mkdir -p "/docs/$(dirname "$item")"
+          cp -n "$item" "/docs/$item"
+        fi
+      done
+    )
+    # 最后写入入口；中途失败时，下次启动仍能补齐资源。
+    cp -n "$TEMPLATE_DIR/index.html" /docs/index.html
     echo "[docsify-server] 范例站点已就绪，编辑 /docs/README.md 开始撰写。"
   else
     echo "[docsify-server] 警告：/docs 无 index.html 且不可写，docsify 可能无法启动。" >&2
@@ -21,4 +29,5 @@ if [ "$DOCSIFY_AUTO_INIT" = "true" ] && [ ! -f /docs/index.html ]; then
 fi
 
 # exec 让 docsify 作为 PID 1 接收 SIGTERM，实现优雅停止
-exec docsify serve .
+# v5 默认只监听 localhost；容器必须监听所有接口才能通过映射端口访问。
+exec docsify serve . --host 0.0.0.0 --port 3000

@@ -6,12 +6,15 @@ on:
     branches: [main]
     paths:
       - Dockerfile
+      - VERSION
+      - "tests/**"
       - docker-entrypoint.sh
       - "template/**"
       - .dockerignore
       - .github/workflows/docker.yml
+      - "scripts/**"
   schedule:
-    - cron: "0 3 15 * *" # At 03:00 on the 15th day of every month (UTC)
+    - cron: "0 3 15 * *" # Monthly CLI and base-image refresh (UTC)
   workflow_dispatch:
 
 # 同一 ref 的发布不互相取消，避免并发推送把标签写乱
@@ -28,60 +31,62 @@ env:
   IMAGE_NAME: docsify-server
 
 jobs:
-  # 第一步：只判断是否需要构建，避免无新版本时白跑重活
+  # 每月统一刷新 CLI 和基础镜像；CLI 版本只解析一次。
   check:
-    name: Check for new docsify-cli version
+    name: Resolve image and docsify-cli versions
     runs-on: ubuntu-latest
     outputs:
-      should_build: ${{ steps.check.outputs.should_build }}
-      version: ${{ steps.check.outputs.version }}
+      version: ${{ steps.versions.outputs.version }}
+      cli_version: ${{ steps.versions.outputs.cli_version }}
     steps:
-      - name: 🔍 Compare npm latest vs last published tag
-        id: check
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test version policy
+        run: sh tests/version.sh
+      - name: Resolve versions
+        id: versions
+        shell: bash
         run: |
-          LATEST=$(npm view docsify-cli version)
-          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          RELEASE_VERSION=$(cat VERSION)
+          CLI_VERSION=$(npm view docsify-cli version)
+          # 主版本、次版本跟随 CLI；本项目修复只提升补丁版本。
+          VERSION=$(sh scripts/image-version.sh "$RELEASE_VERSION" "$CLI_VERSION")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "cli_version=$CLI_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Image: v$VERSION | docsify-cli: $CLI_VERSION"
 
-          # 取最近已发布的非 latest 标签作为上次构建的版本。
-          # || true 兜底：首次构建 / 仓库 404 / 只有 latest 标签时置空，
-          # 空值与 $LATEST 不等 → 触发构建（正是首次该有的行为），不让 pipefail 挂掉整步。
-          PUBLISHED=$(curl -fsSL "https://hub.docker.com/v2/repositories/${{ vars.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}/tags?page_size=100" \
-            | jq -r '.results[].name' | grep -vx latest | head -n1 || true)
-          echo "npm latest: $LATEST | last published: ${PUBLISHED:-<none>}"
-
-          # 定时任务（schedule）只在 docsify-cli 有新版本时构建；
-          # push / workflow_dispatch 一律构建（发布本仓库自身的改动）。
-          if [ "$LATEST" != "$PUBLISHED" ] || [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Scheduled run with no new docsify-cli version — skipping build."
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  # 第二步：仅在需要时构建并推送
+  # 测试成功后才推送多架构镜像
   build:
     name: Push Docker image to Docker Hub and GHCR
     needs: check
-    if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: 🚚 Check out the repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Resolve Node LTS base image
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIGEST=$(docker buildx imagetools inspect node:lts-alpine --format '{{json .Manifest}}' | jq -r '.digest')
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "image=node:lts-alpine@$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: 🔑 Log in to Docker Hub
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: 🔐 Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -89,19 +94,49 @@ jobs:
 
       - name: 🏷️ Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: |
             ${{ vars.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=${{ needs.check.outputs.version }}
+            type=raw,value=v${{ needs.check.outputs.version }}
+            type=raw,value=cli-${{ needs.check.outputs.cli_version }}
             type=raw,value=latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            io.github.rockbenben.docsify-cli.version=${{ needs.check.outputs.cli_version }}
 
-      - name: 🛠️ Build and push Docker image
-        uses: docker/build-push-action@v7
+      - name: Build local image for smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          pull: true
+          build-args: |
+            NODE_IMAGE=${{ steps.base.outputs.image }}
+            DOCSIFY_CLI_VERSION=${{ needs.check.outputs.cli_version }}
+          platforms: linux/amd64
+          load: true
+          tags: docsify-server:smoke-test
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+      # 从宿主机访问映射端口；容器内健康检查无法发现只监听 localhost 的回归。
+      - name: Test container behavior
+        env:
+          IMAGE_VERSION: ${{ needs.check.outputs.version }}
+          CLI_VERSION: ${{ needs.check.outputs.cli_version }}
+        run: python3 tests/smoke.py docsify-server:smoke-test "$IMAGE_VERSION" "$CLI_VERSION"
+
+      - name: 🛠️ Build and push Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          pull: true
+          build-args: |
+            NODE_IMAGE=${{ steps.base.outputs.image }}
+            DOCSIFY_CLI_VERSION=${{ needs.check.outputs.cli_version }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

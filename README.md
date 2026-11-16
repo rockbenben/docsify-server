@@ -1,6 +1,6 @@
 # Docsify Server Docker
 
-A pre-built, multi-arch Docker image that serves your Markdown docs with the official [`docsify-cli`](https://github.com/docsifyjs/docsify-cli). The image is rebuilt automatically whenever a new `docsify-cli` is released, so you always get an up-to-date server without installing anything locally.
+A pre-built, multi-arch Docker image that serves your Markdown docs with the official [`docsify-cli`](https://github.com/docsifyjs/docsify-cli). The workflow refreshes both `docsify-cli` and the Node LTS base image monthly, so you get an up-to-date server without installing anything locally.
 
 Published to both registries:
 
@@ -12,7 +12,7 @@ Published to both registries:
 - 📝 **Effortless docs** — write Markdown, mount it, and Docsify serves it with style.
 - 🐳 **Zero install** — just pull the image; no Node.js or npm on the host.
 - 🏗️ **Multi-arch** — built for `linux/amd64` and `linux/arm64` (Apple Silicon, Raspberry Pi, etc.).
-- 🔄 **Auto-update** — a monthly GitHub Actions job checks npm for a new `docsify-cli` release and only rebuilds when there is one (or when triggered manually).
+- 🔄 **Auto-update** — monthly rebuilds refresh both `docsify-cli` and the Node LTS base image.
 - 🚀 **Zero-config first run** — new to Docsify? Mount an empty folder and the container scaffolds a ready-to-edit starter site for you (see below), so you never hit a cryptic "No docs found" crash.
 - 📴 **Works offline** — the scaffolded site bundles its assets (search, TOC, image zoom, word count) inside the image; no CDN required.
 - 🩺 **Health check** — the container reports healthy once the server responds on port `3000`.
@@ -21,12 +21,13 @@ Published to both registries:
 
 | Tag | Meaning |
 | --- | --- |
-| `latest` | The newest build. |
-| `<x.y.z>` | The latest build for a given `docsify-cli` version (e.g. `4.4.4`) — handy for staying on one Docsify line. |
+| `latest` | The newest tested build. |
+| `5.0.1`, `v5.0.1` | Container release including the v5 port-binding fix. |
+| `cli-<x.y.z>` | The latest build bundling that exact docsify-cli version. |
 
-The version tag mirrors the `docsify-cli` version bundled in that image, so `docsify-server:4.4.4` ships `docsify-cli@4.4.4`.
+The current container release is **v5.0.1**, bundling **docsify-cli 5.0.0**. **Major and minor versions follow docsify-cli; repository fixes only advance the patch version** in [`VERSION`](VERSION). A newer CLI release provides the version baseline: CLI 5.1.0 leads to image v5.1.0, and a subsequent repository fix can release v5.1.1. Within the same major/minor line, the greater of the CLI patch and the repository patch is used. Monthly rebuilds with no version changes reuse the current tags. Older image tags mirrored the complete CLI version; this policy applies from v5.0.1 onward. See the [changelog](CHANGELOG.md).
 
-> **Both `latest` and the version tag are rolling.** A rebuild — whether a new `docsify-cli` release or a change to this repo's image — republishes the *same* tag with fresh contents. If you need a byte-for-byte reproducible deployment, pin by image digest instead, e.g. `ghcr.io/rockbenben/docsify-server@sha256:…`.
+> **All tags are rolling.** Rebuilds can refresh the same tags with new dependencies. Pin an image digest for a byte-for-byte reproducible deployment, e.g. `ghcr.io/rockbenben/docsify-server@sha256:…`. CI images record the exact CLI version in the label `io.github.rockbenben.docsify-cli.version`. Every image also records it in `/opt/docsify-server/DOCSIFY_CLI_VERSION`.
 
 ## Getting Started
 
@@ -68,7 +69,7 @@ docker run -d -p 8080:3000 -v "$(pwd)/docs:/docs" --name docsify-server rockben/
 
 Then open **http://localhost:8080**.
 
-> The container serves whatever is mounted at `/docs` on port `3000`; the examples map it to host port `8080`.
+> The container serves whatever is mounted at `/docs` on `0.0.0.0:3000`; the examples map it to host port `8080`. The listen address is set explicitly so published ports remain reachable with docsify-cli v5, whose default is `localhost`.
 
 ## First run & the starter site
 
@@ -77,7 +78,7 @@ Docsify needs an `index.html` entry point. To keep first-time use painless, the 
 | What you mount | What happens |
 | --- | --- |
 | **Empty folder** | A complete offline example site (`index.html` + bundled `assets/` + a bilingual `README.md`) is scaffolded so you have a working, editable example immediately. |
-| **Markdown files, no `index.html`** | An `index.html` + `assets/` are added; your existing `.md` files are **never** overwritten. |
+| **Markdown files, no `index.html`** | An `index.html` and missing starter assets are added, including inside an existing `assets/` directory; existing files are **never** overwritten. |
 | **Your own `index.html`** | Left completely untouched — bring your own Docsify config and nothing is changed. |
 
 The scaffolded files are just a starter example to get you going and show the format — edit or replace them freely. Once an `index.html` exists in `/docs`, the container never touches your folder again (upgrading the image won't overwrite anything). If you ever want to regenerate the example, delete `/docs/index.html` and restart.
@@ -92,18 +93,30 @@ docker run -d -p 8080:3000 -e DOCSIFY_AUTO_INIT=false -v "$(pwd)/docs:/docs" ghc
 
 ## How the auto-update works
 
-The [`docker.yml`](.github/workflows/docker.yml) workflow runs on three triggers: a monthly **schedule**, a **push** to `main` that changes the image (Dockerfile, entrypoint, template, …), and manual **dispatch**. It has two jobs:
+The [`docker.yml`](.github/workflows/docker.yml) workflow runs monthly, when image inputs change on `main`, and on manual dispatch:
 
-1. **check** — reads the latest `docsify-cli` version from npm and compares it with the last published image tag. It sets `should_build=true` when there is a newer version, **or** whenever the run is a push/manual dispatch (so changes to this repo's own image always publish). A scheduled run with no new `docsify-cli` version is skipped.
-2. **build** — only runs when `should_build=true`; it builds the multi-arch image and pushes the version tag + `latest` to both GHCR and Docker Hub.
+1. **check** resolves the latest stable CLI version from npm once. A newer CLI major/minor line becomes the image version baseline; within the same line, the greater of the CLI patch and `VERSION` patch is used. Older CLI major/minor lines are rejected to prevent accidental downgrades.
+2. **build** installs that exact CLI version, tests container behavior and published-port access, then builds and publishes the multi-arch image to both registries as `latest`, `<version>`, `v<version>`, and `cli-<CLI version>`.
 
-To force a rebuild at any time, trigger the workflow manually via **Actions → Build and Push Docker Image → Run workflow**.
+Every build pulls the current Node LTS base image. Pushes, manual runs, and monthly rebuilds run even when docsify-cli has no new release, so repository fixes and base-image security updates are included. Each CI run resolves the CLI version and the Node LTS multi-architecture digest once. The smoke test and both published architectures receive those same inputs. GitHub Actions dependencies are pinned to verified release commits and reviewed manually before releases. Scheduled checks depend on GitHub Actions scheduling and may be delayed.
+
+To prepare a repository fix release, increment only the patch version in `VERSION` and update `CHANGELOG.md`. Base it on the current published version (for example, set `VERSION` to `5.1.1` after automatically following CLI 5.1.0). Upstream CLI upgrades are picked up by the next monthly build without a repository edit. To force a rebuild, use **Actions → Build and Push Docker Image → Run workflow**.
 
 ## Building locally
 
 ```sh
-docker build -t docsify-server .
+docker build --pull --no-cache -t docsify-server .
 docker run -d -p 8080:3000 -v "$(pwd)/docs:/docs" docsify-server
 ```
 
-The image is based on `node:lts-alpine` and installs `docsify-cli@latest` at build time.
+The image is based on `node:lts-alpine`. Local builds default to `docsify-cli@latest`; use `--pull --no-cache` to refresh both the base image and the npm installation. CI resolves the latest CLI version once and passes that concrete version to all builds. To select a specific CLI version:
+
+```sh
+docker build --pull --build-arg DOCSIFY_CLI_VERSION=5.0.0 -t docsify-server .
+```
+
+Run the same container checks used before publishing (Python 3 and Docker required):
+
+```sh
+python3 tests/smoke.py docsify-server
+```
